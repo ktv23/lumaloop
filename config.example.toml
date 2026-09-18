@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# lumaloop configuration.
+#
+# Copy to ~/.config/lumaloop/config.toml and uncomment what you need.
+# Every key is optional: anything you leave out keeps the built-in default
+# shown here. Run `lumaloop --show-config` to see what is actually in effect,
+# and `lumaloop --list-devices` to find your camera.
+#
+# The [tables] are only for readability - a key means the same thing
+# whichever table it sits in.
+
+[camera]
+# Pick ONE of these three, or none. With none set, the first capture-capable
+# device that is not the loopback wins - fine if you have a single webcam,
+# wrong if you also have a built-in one (a laptop usually enumerates the
+# internal camera first).
+#
+# by-id is the sturdy choice: it survives replugs and reboots, where
+# /dev/videoN does not. Run `ls /dev/v4l/by-id` and keep the *-index0 entry.
+# camera_device = "/dev/video2"
+# camera_by_id  = "/dev/v4l/by-id/usb-046d_Logitech_BRIO_*-video-index0"
+# camera_name   = "BRIO"
+
+# The v4l2loopback sink. Unset = the first loopback device found.
+# vcam_device = "/dev/video10"
+# vcam_name   = "OBS Virtual Camera"
+
+# Capture format. 1080p30 is what most video apps cap at.
+# w   = 1920
+# h   = 1080
+# fps = 30
+
+[exposure]
+# The target is a percentile of a metering box, not a frame average - see the
+# comments in `lumaloop` for why. target is the luma level (0-255) the subject
+# should sit at; raise it for a brighter picture.
+# target     = 132
+# percentile = 70
+# deadband   = 5
+
+# The metering box as fractions of the frame: (x0, x1, y0, y1). The default
+# is the middle half horizontally, top 10% trimmed, running to the bottom
+# edge - a seated subject's chest is usually the brightest thing in frame and
+# the highlight guard needs to see it.
+# box = [0.25, 0.75, 0.10, 1.00]
+
+# Metering frame size. ffmpeg downscales to this before the box is measured,
+# which is what keeps metering nearly free. Rarely worth changing.
+# mw = 192
+# mh = 108
+
+# Highlight ceiling: brightening is vetoed while the p99 of the box is above
+# it, and exceeding it forces darkening. Lower this if faces still clip.
+# high_pct  = 99
+# high_max  = 235
+# high_db   = 5
+# sat_level = 250
+# sat_step  = 0.20
+
+# Below this subject level the ceiling stops forcing darkening: with direct
+# sun on a light shirt the highlights cannot be recovered at all, and chasing
+# them crushes the whole frame. Blown highlights beat a black picture.
+# subject_floor = 105
+
+[actuators]
+# exp_max 320 is the limit at 30fps (~1/31s). Gain is amplification, not
+# light, so it is capped to bound the noise; the loop spends exposure first
+# and only reaches for gain once exposure is maxed.
+# exp_min       = 20
+# exp_max       = 320
+# gain_max      = 160
+# gain_per_luma = 4.0
+
+# Proportional gain, and per-correction rate limits. Darkening is deliberately
+# faster than brightening: being blown out is worse than being briefly dim.
+# damping        = 0.5
+# max_step_up    = 0.20
+# max_step_down  = 0.35
+# gain_step_up   = 2
+# gain_step_down = 8
+
+[timing]
+# latency_s keeps the loop from acting on a frame that predates its own last
+# correction - without it every correction lands twice.
+# interval_s  = 1.0
+# latency_s   = 1.2
+# stale_s     = 4.0
+# min_samples = 2
+# smooth_n    = 3
+# heartbeat_s = 30.0
+
+[colour]
+# Applied once at startup, not servoed. The saturation scale is
+# camera-specific: check `v4l2-ctl -d /dev/videoN --list-ctrls`. Unset leaves
+# the camera's own setting alone.
+# saturation = 131
+
+# Controls that standard V4L2 does not expose, applied via the cameractrls
+# flatpak (hu.irl.cameractrls) when installed. A Logitech BRIO's field of
+# view is 65, 78 or 90 and resets to 90 on every power-cycle:
+# vendor_controls = ["logitech_brio_fov=65"]
+
+# ffmpeg filters, by cost at 1080p30 on one core: eq=saturation +1%,
+# vibrance +108%, lut3d +341%. Both off by default.
+# vibrance = 0.0
+# lut      = "/path/to/grade.cube"
+
+[snapshot]
+# The JPEG the status app displays, and the only way to see the output while
+# a video app holds the virtual camera. 0 seconds turns it off.
+# snapshot      = "~/.cache/lumaloop/snap.jpg"
+# snapshot_secs = 5

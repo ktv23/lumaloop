@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Application
+Name=lumaloop
+GenericName=lumaloop auto-exposure
+Comment=Start the webcam auto-exposure pipeline and see what it is doing
+Exec=@BINDIR@/lumaloop-app
+Icon=camera-web
+Terminal=false
+Categories=AudioVideo;
+Keywords=webcam;camera;exposure;video;brio;logitech;
+StartupNotify=true
+StartupWMClass=lumaloop-app

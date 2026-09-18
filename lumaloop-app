@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+# lumaloop - subject-weighted auto exposure for USB webcams
+# Copyright (C) 2026 ktv23
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+A small status window for lumaloop.service.
+
+The pipeline itself is `lumaloop`, running as a user systemd unit. This window
+is only a face on it, and does three things:
+
+  - starts / stops the unit. Start always does reset-failed first: a boot with
+    the camera unplugged burns StartLimitBurst and leaves the unit stuck in
+    'failed', where Restart=always never fires again. Clicking Start should
+    just work, whatever state it was left in.
+
+  - follows the unit's journal and turns the metering lines into words. The
+    pipeline already says everything worth knowing, in its own terms
+    ("p70 138 p99 174 exposure 313 -> 306 (above target)"); the window only
+    translates.
+
+  - shows the snapshot the pipeline writes. Once a video app is on the virtual
+    camera nothing else can stream it, so that snapshot is the only way to see
+    what the pipeline is actually producing.
+
+Reads the same config file as the pipeline, for the snapshot path.
+"""
+import os
+import re
+import subprocess
+import time
+
+from PySide6.QtCore import Qt, QFileSystemWatcher, QProcess, QTimer
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QPushButton,
+                               QSizePolicy, QVBoxLayout, QWidget)
+
+try:
+    import tomllib                     # Python 3.11+
+except ModuleNotFoundError:
+    tomllib = None
+
+UNIT = "lumaloop.service"
+
+_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+_CACHE_HOME  = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+CONFIG_PATH  = os.path.join(_CONFIG_HOME, "lumaloop", "config.toml")
+
+
+def _configured(key, fallback):
+    """One value out of the pipeline's config, whatever table it sits in.
+
+    The window has to agree with the pipeline about where the snapshot is
+    written, and the pipeline's config is the single place that says so.
+    """
+    if tomllib is None or not os.path.exists(CONFIG_PATH):
+        return fallback
+    try:
+        with open(CONFIG_PATH, "rb") as fh:
+            raw = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        return fallback
+    for section in [raw] + [v for v in raw.values() if isinstance(v, dict)]:
+        if key in section:
+            return section[key]
+    return fallback
+
+
+SNAPSHOT = os.path.expanduser(
+    _configured("snapshot", os.path.join(_CACHE_HOME, "lumaloop", "snap.jpg")))
+VCAM_LABEL = _configured("vcam_name", "") or "the virtual camera"
+PREVIEW_W   = 384
+PREVIEW_H   = 216
+SNAP_STALE  = 25     # seconds before a snapshot counts as "not arriving"
+POLL_MS     = 2000   # how often the unit's state is checked
+PREVIEW_MS  = 400    # backstop poll; inotify does the real work
+CLOCK_MS    = 100    # how often the "last frame" stopwatch is redrawn
+
+# Colours for the state dot. Kept literal rather than themed: green/amber/red
+# have to mean the same thing in a light and a dark palette.
+OK, BUSY, BAD, OFF = "#2ec27e", "#e5a50a", "#e01b24", "#9a9996"
+
+# "  p70 132 p99 174  exposure 313  gain 0   (in band)"
+# "  p70 138 p99 174  exposure 313 -> 306      (above target)"
+METER = re.compile(
+    r"p(?P<pc>\d+)\s+(?P<lvl>\d+)\s+"
+    r"p(?P<hpc>\d+)\s+(?P<high>\d+)(?P<mark>[*\s])\s+"
+    r"(?P<what>.*?)\s+\((?P<why>[^)]+)\)\s*$")
+# Each line names only the knob that just moved ("gain 20 -> 22"), so the
+# two are tracked separately and each keeps its last known value.
+KNOB = {n: re.compile(rf"{n}\s+(\d+)(?:\s*->\s*(\d+))?")
+        for n in ("exposure", "gain")}
+
+# The pipeline's own words -> what is actually happening, for someone who
+# just wants to know whether they look right on the call.
+BRIGHTNESS = {
+    "in band":      ("on target",                  OK),
+    "above target": ("a little bright, correcting", BUSY),
+    "below target": ("a little dark, correcting",   BUSY),
+    "over ceiling": ("pulling back for highlights", BUSY),
+    "saturated":    ("blown out, pulling back",     BAD),
+}
+
+
+def dimmed(widget, fraction=0.58):
+    """A muted version of the theme's own text colour.
+
+    NOT palette(mid): that is a frame-shading role, and on a dark theme it
+    lands within a few points of the window background - the label renders,
+    reserves its space, and is simply invisible. Blending foreground toward
+    background works in both light and dark schemes.
+    """
+    pal = widget.palette()
+    fg = pal.color(QPalette.WindowText)
+    bg = pal.color(QPalette.Window)
+    f = fraction
+    return QColor(
+        round(fg.red()   * f + bg.red()   * (1 - f)),
+        round(fg.green() * f + bg.green() * (1 - f)),
+        round(fg.blue()  * f + bg.blue()  * (1 - f))).name()
+
+
+def systemctl(*args, capture=True):
+    return subprocess.run(("systemctl", "--user") + args,
+                          capture_output=capture, text=True)
+
+
+class Row(QWidget):
+    """One 'label  value' line in the readout."""
+
+    def __init__(self, name):
+        super().__init__()
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        key = QLabel(name)
+        key.setFixedWidth(96)
+        key.setStyleSheet(f"color: {dimmed(key)};")
+        self.value = QLabel("--")
+        lay.addWidget(key)
+        lay.addWidget(self.value, 1)
+
+    def set(self, text, colour=None):
+        self.value.setText(text)
+        self.value.setStyleSheet(f"color: {colour};" if colour else "")
+
+
+class CameraWindow(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("lumaloop")
+        self.setWindowIcon(QIcon.fromTheme("camera-web"))
+        self.active = False          # unit state, from systemctl
+        self.meter = None            # last parsed metering line
+        self.knobs = {}               # last known exposure / gain
+        self.note = None             # last non-metering line worth showing
+        self.journal = None
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(14)
+
+        self.preview = QLabel()
+        self.preview.setFixedSize(PREVIEW_W, PREVIEW_H)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet(
+            "background: #1b1b1b; border-radius: 6px; color: #777;")
+        root.addWidget(self.preview, 0, Qt.AlignHCenter)
+
+        # The picture alone cannot show whether it is live: a still room looks
+        # identical frozen or updating. This line is the proof - it counts up
+        # between frames and resets each time the file on disk changes.
+        self.snapinfo = QLabel()
+        self.snapinfo.setAlignment(Qt.AlignCenter)
+        mono = QFont("monospace")
+        mono.setStyleHint(QFont.Monospace)
+        mono.setPointSizeF(self.font().pointSizeF() - 0.5)
+        self.snapinfo.setFont(mono)
+        self.snapinfo.setStyleSheet(f"color: {dimmed(self.snapinfo)};")
+        root.addWidget(self.snapinfo)
+
+        self.state = QLabel()
+        f = QFont(self.font())
+        f.setPointSizeF(f.pointSizeF() + 1.5)
+        f.setBold(True)
+        self.state.setFont(f)
+        root.addWidget(self.state)
+
+        self.rows = {n: Row(n) for n in
+                     ("Brightness", "Highlights", "Exposure", "Gain")}
+        for row in self.rows.values():
+            root.addWidget(row)
+        # Gain is only interesting once the camera runs out of exposure and
+        # starts trading noise for brightness, so it stays hidden at 0.
+        self.rows["Gain"].hide()
+
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet(f"color: {dimmed(self.hint)};")
+        root.addWidget(self.hint)
+
+        root.addStretch(1)
+
+        self.button = QPushButton()
+        self.button.setMinimumHeight(38)
+        self.button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.button.clicked.connect(self.toggle)
+        root.addWidget(self.button)
+
+        self.snap_mtime = 0
+        self.snap_interval = None    # measured gap between the last two frames
+        self.snap_count = 0          # frames that actually changed on disk
+
+        self.poll()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+        self.timer.start(POLL_MS)
+
+        # The preview gets its own, faster timer. Polling the unit is a fork
+        # per tick and does not need to be quick; noticing a new snapshot is
+        # one stat() and wants to be. Sharing one 2s timer also beat the
+        # snapshot's own cadence, so a new frame surfaced 4-6s late.
+        # inotify, so the stopwatch resets the moment ffmpeg writes the file
+        # rather than up to PREVIEW_MS later - that lag was why the counter
+        # visibly ran past 5.0s before flipping, every single cycle.
+        self.watcher = QFileSystemWatcher(self)
+        self.watcher.fileChanged.connect(self.poll_snapshot)
+        self.watch_file()
+
+        # The timer stays as a backstop: QFileSystemWatcher drops its watch
+        # when a file is replaced rather than modified in place, and ffmpeg's
+        # -update 1 can do either depending on how the muxer flushes.
+        self.snap_timer = QTimer(self)
+        self.snap_timer.timeout.connect(self.poll_snapshot)
+        self.snap_timer.start(PREVIEW_MS)
+
+        self.clock = QTimer(self)
+        self.clock.timeout.connect(self.tick)
+        self.clock.start(CLOCK_MS)
+        self.tick()
+
+    # -- the unit ---------------------------------------------------------
+
+    def toggle(self):
+        if self.active:
+            systemctl("stop", UNIT)
+            self.meter = self.note = None
+            self.knobs = {}
+        else:
+            # Always clear the failed state first - see the module docstring.
+            systemctl("reset-failed", UNIT)
+            systemctl("start", UNIT)
+            self.state.setText("Starting...")
+            self.state.setStyleSheet(f"color: {BUSY};")
+        QTimer.singleShot(400, self.poll)
+
+    def poll(self):
+        was = self.active
+        self.active = systemctl("is-active", UNIT).stdout.strip() == "active"
+        if self.active and not was:
+            self.start_journal()
+        elif was and not self.active:
+            self.stop_journal()
+            self.meter = None
+            self.knobs = {}
+            self.snap_mtime = 0
+            self.snap_interval = None
+            self.snap_count = 0
+        self.refresh()
+
+    def watch_file(self):
+        """(Re-)arm the inotify watch if the file exists and is unwatched."""
+        if os.path.exists(SNAPSHOT) and SNAPSHOT not in self.watcher.files():
+            self.watcher.addPath(SNAPSHOT)
+
+    def poll_snapshot(self, *_):
+        """Redraw only when the file on disk has actually changed."""
+        self.watch_file()
+        if not self.active:
+            return
+        try:
+            mtime = os.path.getmtime(SNAPSHOT)
+        except OSError:
+            return
+        if mtime != self.snap_mtime:
+            if self.snap_mtime:
+                self.snap_interval = mtime - self.snap_mtime
+            self.snap_mtime = mtime
+            self.snap_count += 1
+            self.draw_preview()
+            self.tick()
+        elif self.stale(mtime):
+            self.draw_preview()      # keep the "not updating" veil honest
+
+    def tick(self):
+        """Redraw the stopwatch under the preview."""
+        if not self.active or not self.snap_mtime:
+            self.snapinfo.setText("")
+            return
+        age = time.time() - self.snap_mtime
+        every = f"every {self.snap_interval:.1f}s" if self.snap_interval else "measuring"
+        self.snapinfo.setText(
+            f"last frame {age:4.1f}s ago  \u00b7  {every}  \u00b7  "
+            f"{self.snap_count} frame{'' if self.snap_count == 1 else 's'}")
+
+    # -- the journal ------------------------------------------------------
+
+    def start_journal(self):
+        self.stop_journal()
+        self.journal = QProcess(self)
+        self.journal.setProcessChannelMode(QProcess.MergedChannels)
+        self.journal.readyReadStandardOutput.connect(self.read_journal)
+        # -n 40 so an already-running pipeline fills the window immediately
+        # instead of staying blank until the next correction.
+        self.journal.start("journalctl", ["--user", "-u", UNIT,
+                                          "-f", "-n", "40", "-o", "cat"])
+
+    def stop_journal(self):
+        if self.journal:
+            self.journal.kill()
+            self.journal.waitForFinished(500)
+            self.journal = None
+
+    def read_journal(self):
+        data = bytes(self.journal.readAllStandardOutput()).decode(errors="replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            m = METER.search(line)
+            if m:
+                self.meter = m
+                self.note = None
+                for name, pattern in KNOB.items():
+                    k = pattern.search(m["what"])
+                    if k:
+                        self.knobs[name] = int(k.group(2) or k.group(1))
+            elif "not found" in line:
+                self.note = "Camera not found - is it plugged in?"
+            elif "waiting for metering frames" in line:
+                self.note = "Waiting for the first frames..."
+            elif "ffmpeg died" in line:
+                self.note = "Video pipeline restarting..."
+            elif "camera drifted" in line:
+                self.note = "Camera drifted - re-adopting its settings"
+        self.refresh()
+
+    # -- drawing ----------------------------------------------------------
+
+    def refresh(self):
+        self.button.setText("Stop camera" if self.active else "Start camera")
+
+        if not self.active:
+            self.state.setText("Stopped")
+            self.state.setStyleSheet(f"color: {OFF};")
+            self.hint.setText("Start the camera before joining a call.")
+            for row in self.rows.values():
+                row.set("--")
+            self.draw_preview(off=True)
+            return
+
+        self.hint.setText(f"Pick {VCAM_LABEL} as your camera in your video app.")
+        self.draw_preview()
+
+        if self.note:
+            self.state.setText(self.note)
+            self.state.setStyleSheet(f"color: {BUSY};")
+            return
+        if not self.meter:
+            self.state.setText("Starting...")
+            self.state.setStyleSheet(f"color: {BUSY};")
+            return
+
+        why = self.meter["why"]
+        limited = "AT LIMIT" in why
+        word, colour = BRIGHTNESS.get(why.split(" - ")[0], ("adjusting", BUSY))
+        if limited:
+            word += " (as far as it can)"
+            colour = BAD
+
+        self.state.setText("Running - feeding the virtual camera")
+        self.state.setStyleSheet(f"color: {OK};")
+        self.rows["Brightness"].set(word, colour)
+
+        high = int(self.meter["high"])
+        if high >= 250:
+            self.rows["Highlights"].set("clipping", BAD)
+        elif high >= 230:
+            self.rows["Highlights"].set("close to clipping", BUSY)
+        else:
+            self.rows["Highlights"].set("not clipping", OK)
+
+        self.rows["Exposure"].set(str(self.knobs.get("exposure", "--")))
+        gain = self.knobs.get("gain")
+        self.rows["Gain"].setVisible(bool(gain))
+        if gain:
+            self.rows["Gain"].set(f"{gain} (brightening a dark room)", BUSY)
+
+    def draw_preview(self, off=False):
+        if off or not os.path.exists(SNAPSHOT):
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("Camera off" if off else "No picture yet")
+            return
+
+        age = os.path.getmtime(SNAPSHOT)
+        pix = QPixmap(SNAPSHOT)
+        if pix.isNull():
+            # Half-written file: keep whatever is on screen and come back.
+            if self.preview.pixmap().isNull():
+                self.preview.setText("No picture yet")
+            QTimer.singleShot(60, self.draw_preview)
+            return
+        pix = pix.scaled(PREVIEW_W, PREVIEW_H,
+                         Qt.KeepAspectRatio, Qt.SmoothTransformation)
+
+        # A snapshot that has stopped updating means the pipeline is stalled,
+        # not that the picture is fine. Say so on the picture itself.
+        if self.stale(age):
+            painter = QPainter(pix)
+            painter.fillRect(pix.rect(), QColor(0, 0, 0, 140))
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(pix.rect(), Qt.AlignCenter, "picture not updating")
+            painter.end()
+
+        self.preview.setText("")
+        self.preview.setPixmap(pix)
+
+    @staticmethod
+    def stale(mtime):
+        return time.time() - mtime > SNAP_STALE
+
+    def closeEvent(self, event):
+        self.stop_journal()
+        super().closeEvent(event)
+
+
+def main():
+    app = QApplication([])
+    app.setApplicationName("lumaloop")
+    app.setDesktopFileName("lumaloop")
+    win = CameraWindow()
+    win.show()
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()

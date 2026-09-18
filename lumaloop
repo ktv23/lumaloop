@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+# lumaloop - subject-weighted auto exposure for USB webcams
+# Copyright (C) 2026 ktv23
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+Subject-weighted auto exposure for a USB webcam, feeding a virtual camera.
+
+  /dev/videoN --ffmpeg--+--> /dev/videoM (v4l2loopback) --> your video app
+                        |
+                        +--> 192x108 yuv420p frames on a pipe --> this process,
+                        |    which meters them and drives MANUAL exposure/gain
+                        |
+                        +--> a JPEG snapshot every few seconds
+
+Why this exists: most webcams meter the whole frame. Sit with a window behind
+you and the camera reads that bright background as correctly exposed while
+your face goes dark - or reads a dark room as underexposed and blows your face
+out. Many cameras (the Logitech BRIO this was written for among them) expose
+no exposure-compensation control, so the correction loop has to live outside
+the camera.
+
+Why tee a pipe instead of reading the virtual camera back: v4l2loopback allows
+several openers but only ONE streaming consumer. Once a video app is on the
+feed, any other reader gets EBUSY and the meter goes blind - silently.
+
+Why a snapshot: same reason. It is the only way to see what the pipeline is
+producing while something else holds the virtual camera.
+
+Why percentiles over a wide box, not a mean over a face box: a face box goes
+stale as soon as the subject shifts in their seat, then it meters the wall and
+runs exposure away. p70 of a wide box tracks the subject wherever they sit;
+p99 tracks the brightest thing regardless of how much dark room surrounds it.
+
+Every setting below can be overridden from a config file - see
+config.example.toml and `lumaloop --help`. Nothing here needs editing.
+"""
+import argparse, atexit, glob, os, signal, subprocess, sys, threading, time
+from collections import deque
+
+try:
+    import tomllib                     # Python 3.11+
+except ModuleNotFoundError:            # pragma: no cover - older interpreters
+    tomllib = None
+
+# =========================================================================
+# Devices
+# =========================================================================
+# Device numbers shift when things are replugged or modules load in a
+# different order, so devices are resolved at runtime rather than hardcoded.
+#
+# Three ways to name the camera, tried in this order. Leave them all empty
+# and the first capture-capable device that is not the loopback wins, which
+# is right on a machine with one webcam.
+#   CAMERA_DEVICE  an explicit node, e.g. "/dev/video2"
+#   CAMERA_BY_ID   a glob under /dev/v4l/by-id, which survives replugs, e.g.
+#                  "/dev/v4l/by-id/usb-046d_Logitech_BRIO_*-video-index0"
+#                  (run `ls /dev/v4l/by-id` to find yours)
+#   CAMERA_NAME    a substring of the v4l2 card name, e.g. "BRIO"
+CAMERA_DEVICE = ""
+CAMERA_BY_ID  = ""
+CAMERA_NAME   = ""
+
+# The v4l2loopback sink. Empty = auto-detect the first loopback device, which
+# is what you want unless you run several. Otherwise give an explicit node or
+# a substring of its card label ("OBS Virtual Camera" is the label OBS uses).
+VCAM_DEVICE = ""
+VCAM_NAME   = ""
+
+W, H, FPS = 1920, 1080, 30         # most video apps cap at 1080p anyway
+MW, MH    = 192, 108               # metering frame size (ffmpeg downscales)
+
+# =========================================================================
+# Exposure targets
+# =========================================================================
+TARGET     = 132   # desired p70 of the metering box (subject level)
+PERCENTILE = 70    # calibrated: p70 of the box == face mean (175 vs 174.4)
+DEADBAND   = 5     # luma levels of slack around TARGET
+
+# Metering box as frame fractions (x0, x1, y0, y1). y runs to the bottom
+# edge on purpose: a seated subject's chest/shirt sits at y 0.75-1.00 and
+# is usually the brightest thing in frame. Cutting the box at 0.85 once
+# made the highlight ceiling blind to a shirt that was 43% blown.
+BOX = (0.25, 0.75, 0.10, 1.00)
+
+# Highlight ceiling. A high percentile, NOT a fraction-of-frame clip count:
+# this room's background is nearly black (mean ~10), so a shirt that is 17%
+# blown registers as 2% of the box and a fraction-based guard never fires.
+# p99 rather than p95: a lower percentile only tracks the bright region
+# while that region is small; sit closer and p95 slides into the shirt's
+# midtones while its top clips unseen.
+#
+# Thresholds, on the 192x108 metering frame (each pixel averages ~100
+# source pixels, so true clipping reads a little lower here than at full
+# res):
+#   p99 <  HIGH_MAX - HIGH_DB  (230)  highlights have room: brightening allowed
+#   p99 >  HIGH_MAX + HIGH_DB  (240)  over the ceiling: darken, proportional
+#   p99 >= SAT_LEVEL           (250)  saturated: the excess is meaningless
+#                                     (pins near 253 however far over the
+#                                     scene is), darken at a fixed rate
+HIGH_PCT  = 99
+HIGH_MAX  = 235
+HIGH_DB   = 5
+SAT_LEVEL = 250
+SAT_STEP  = 0.20   # fraction of exposure removed per correction while saturated
+
+# Floor under the ceiling. Direct sun on a light shirt saturates the sensor
+# outright - exposure can drop 30% and p99 moves 253 -> 251. Without a
+# floor the loop keeps darkening toward EXP_MIN chasing a ceiling it cannot
+# reach, crushing the whole frame to defend highlights that are already
+# lost. At or below this subject level the ceiling stops forcing darkening.
+# Brightening stays vetoed while highlights are over the ceiling, so the
+# result is a HOLD, not a hand-over to TARGET: blown highlights beat a
+# black frame. The real fix in that condition is blocking the sun.
+SUBJECT_FLOOR = 105
+
+# =========================================================================
+# Actuator limits and rates
+# =========================================================================
+# EXP_MIN 20 (~1/500s): nothing indoors needs shorter, and a floor of 8 once
+# let a sun episode dig a hole that took a minute to climb out of.
+EXP_MIN, EXP_MAX = 20, 320   # 320 ~= 1/31s, the limit at 30fps
+GAIN_MAX      = 160          # gain is amplification, not light; cap the noise
+GAIN_PER_LUMA = 4.0          # measured: 1 gain unit ~= 4 luma levels
+
+DAMPING = 0.5                # proportional gain on (error / level)
+
+# Asymmetric rate limits, per correction. Darkening is quick because being
+# blown out is worse than being briefly dim, and a mis-metered excursion
+# (leaning out of frame) should recover in seconds. Brightening is slower
+# so it does not leap across the ceiling's hysteresis band.
+MAX_STEP_UP    = 0.20
+MAX_STEP_DOWN  = 0.35
+GAIN_STEP_UP   = 2
+GAIN_STEP_DOWN = 8
+
+# =========================================================================
+# Measurement timing
+# =========================================================================
+# The metering stream is 1fps. Each frame is measured in the reader thread
+# and timestamped. The controller:
+#   - ignores samples older than STALE_S (frozen pipe, ffmpeg restarting)
+#   - ignores samples taken within LATENCY_S of its last correction, so it
+#     never acts on a frame that predates the change it just made. Without
+#     this a median filter lags one iteration and every correction lands
+#     twice - roughly double the rate limit, which is what produced the
+#     dip-and-recover swings.
+#   - needs at least MIN_SAMPLES fresh samples, and takes the median of up
+#     to SMOOTH_N, to reject a single odd frame (a hand passing, a flicker).
+INTERVAL_S  = 1.0
+LATENCY_S   = 1.2
+STALE_S     = 4.0
+MIN_SAMPLES = 2
+SMOOTH_N    = 3
+HEARTBEAT_S = 30.0    # print state this often even when holding
+
+# =========================================================================
+# Colour and framing (applied once at startup, not servoed)
+# =========================================================================
+# Colour, by CPU cost at 1080p30 (baseline decode = 32% of one core):
+#   camera saturation control   +0%     firmware, but global
+#   eq=saturation               +1%     global
+#   vibrance                    +108%   selective (spares saturated colour)
+#   lut3d                       +341%   selective, not worth 3.4 cores
+# Saturation is not servoed: it does not drift with light, so a loop would
+# just chase you changing clothes. Global, so keep it modest or lips go
+# lurid before skin gains much.
+# None = leave the camera's own setting alone. The scale is camera-specific;
+# check yours with `v4l2-ctl -d /dev/videoN --list-ctrls`.
+SATURATION = None
+
+# White balance is left to the camera's AWB. A grey-world loop was tried and
+# removed: it assumes the scene averages neutral, which a real room (wood
+# floor, beige walls, warm shelving) does not, so it read the warmth as a
+# cast and cooled until whites went blue.
+
+# Vendor controls that standard V4L2 does not expose, applied through the
+# cameractrls flatpak (hu.irl.cameractrls) when it is installed. Each entry
+# is a "control=value" string. Empty = no flatpak dependency at all.
+#
+# These typically reset on every camera power-cycle, so they are re-applied
+# at startup and after an ffmpeg restart. Example for a Logitech BRIO, whose
+# field of view is 65, 78 or 90 and resets to 90 whenever it power-cycles:
+#   vendor_controls = ["logitech_brio_fov=65"]
+VENDOR_CONTROLS = []
+
+VIBRANCE = 0.0        # ffmpeg selective saturation; ~1.4 cores. 0 = off
+LUT      = ""         # path to a .cube; ~3.4 cores. "" = off
+
+_CACHE_HOME   = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+SNAPSHOT      = os.path.join(_CACHE_HOME, "lumaloop", "snap.jpg")
+SNAPSHOT_SECS = 5     # 0 = off. The status app reads this file.
+
+# =========================================================================
+# Configuration
+# =========================================================================
+# Everything uppercase above is a default. A config file may override any of
+# them by lowercase name; anything it does not mention keeps the value above,
+# so a config file only needs the handful of lines you actually care about.
+DEFAULTS = {k: v for k, v in list(globals().items())
+            if k.isupper() and not k.startswith("_")}
+
+_CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+CONFIG_PATH  = os.path.join(_CONFIG_HOME, "lumaloop", "config.toml")
+
+
+def _coerce(value, default):
+    """Match a config value to the type of the default it replaces."""
+    if default is None:
+        return value
+    if isinstance(default, tuple):
+        return tuple(type(default[0])(v) for v in value)
+    if isinstance(default, list):
+        return list(value)
+    if isinstance(default, bool):
+        return bool(value)
+    if isinstance(default, float):
+        return float(value)
+    if isinstance(default, int):
+        return int(value)
+    if isinstance(default, str):
+        return str(value)
+    return value
+
+
+def load_config(path):
+    """Read a TOML config and apply it over the defaults.
+
+    Tables are flattened, so grouping keys under [camera] or [exposure] is
+    cosmetic - it keeps a long config readable without making the names
+    depend on which group you filed them under.
+    """
+    if not os.path.exists(path):
+        return []
+    if tomllib is None:
+        return [f"{path} ignored: Python 3.11+ is needed to read TOML"]
+    try:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        sys.exit(f"cannot read {path}: {e}")
+
+    flat = {}
+    for key, value in raw.items():
+        if isinstance(value, dict):
+            flat.update(value)
+        else:
+            flat[key] = value
+
+    notes = []
+    for key, value in flat.items():
+        name = key.upper()
+        if name not in DEFAULTS:
+            notes.append(f"{path}: unknown setting {key!r}, ignored")
+            continue
+        try:
+            globals()[name] = _coerce(value, DEFAULTS[name])
+        except (TypeError, ValueError) as e:
+            sys.exit(f"{path}: bad value for {key!r}: {e}")
+    return notes
+
+
+def show_config():
+    for name in sorted(DEFAULTS):
+        current, default = globals()[name], DEFAULTS[name]
+        mark = "  " if current == default else "* "
+        print(f"{mark}{name.lower():<16} {current!r}")
+    print("\n* = changed from the built-in default")
+
+
+def list_devices():
+    for dev, name in _nodes():
+        kind = []
+        if _has_capture(dev):
+            kind.append("capture")
+        if _is_loopback(dev):
+            kind.append("loopback")
+        print(f"{dev:<14} {name:<40} {' '.join(kind) or '-'}")
+    print("\nStable names that survive a replug:")
+    for link in sorted(glob.glob("/dev/v4l/by-id/*")):
+        print(f"  {link}")
+
+
+# =========================================================================
+# Device resolution
+# =========================================================================
+def _nodes():
+    for n in sorted(glob.glob("/sys/class/video4linux/video*")):
+        try:
+            name = open(f"{n}/name").read().strip()
+        except OSError:
+            continue
+        yield f"/dev/{os.path.basename(n)}", name
+
+def _has_capture(dev):
+    r = sh(f"v4l2-ctl -d {dev} --list-formats")
+    return "MJPG" in r.stdout or "YUYV" in r.stdout
+
+def _is_loopback(dev):
+    out = sh(f"v4l2-ctl -d {dev} --info").stdout.lower()
+    return "v4l2 loopback" in out or "v4l2loopback" in out
+
+def resolve_cam():
+    """The real camera: explicit node, then by-id glob, then card name."""
+    if CAMERA_DEVICE:
+        return CAMERA_DEVICE if os.path.exists(CAMERA_DEVICE) else None
+    if CAMERA_BY_ID:
+        hits = sorted(glob.glob(CAMERA_BY_ID))
+        return os.path.realpath(hits[0]) if hits else None
+    for dev, name in _nodes():
+        if CAMERA_NAME:
+            if CAMERA_NAME.lower() in name.lower() and _has_capture(dev):
+                return dev
+        elif _has_capture(dev) and not _is_loopback(dev):
+            return dev          # single-webcam machine: take the only one
+    return None
+
+def resolve_vcam():
+    """The v4l2loopback sink: explicit node, then card name, then any loopback."""
+    if VCAM_DEVICE:
+        return VCAM_DEVICE if os.path.exists(VCAM_DEVICE) else None
+    for dev, name in _nodes():
+        if VCAM_NAME:
+            if VCAM_NAME.lower() in name.lower():
+                return dev
+        elif _is_loopback(dev):
+            return dev
+    return None
+
+def describe_camera_setting():
+    """How the camera is being looked for, for a useful error message."""
+    if CAMERA_DEVICE:
+        return f"camera_device = {CAMERA_DEVICE!r}"
+    if CAMERA_BY_ID:
+        return f"camera_by_id = {CAMERA_BY_ID!r}"
+    if CAMERA_NAME:
+        return f"camera_name = {CAMERA_NAME!r}"
+    return "no camera configured, so the first capture device was tried"
+
+# =========================================================================
+# Camera control
+# =========================================================================
+CAM = VCAM = None
+
+def sh(cmd):
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+def get_ctrl(name):
+    r = sh(f"v4l2-ctl -d {CAM} --get-ctrl={name}")
+    try:
+        return int(r.stdout.split(":")[1])
+    except (ValueError, IndexError):
+        return None
+
+def set_ctrls(**kv):
+    args = ",".join(f"{k}={int(v)}" for k, v in kv.items())
+    return sh(f"v4l2-ctl -d {CAM} --set-ctrl={args}").returncode == 0
+
+def log(msg):
+    print(msg, flush=True)
+
+def camera_setup():
+    """Everything that must be re-asserted after the camera power-cycles."""
+    # Manual exposure from the start. Previously auto_exposure=1 was only
+    # sent on the first correction, so after a power-cycle the firmware's
+    # AE could be driving while the loop believed it was holding.
+    ctrls = {"auto_exposure": 1, "white_balance_automatic": 1}
+    if SATURATION is not None:
+        ctrls["saturation"] = SATURATION
+    set_ctrls(**ctrls)
+
+    applied = []
+    for control in VENDOR_CONTROLS:
+        r = sh("flatpak run --command=cameractrls.py hu.irl.cameractrls "
+               f"-d {CAM} -c {control}")
+        if r.returncode != 0:
+            log(f"  could not set {control} "
+                f"(is the cameractrls flatpak installed?): "
+                f"{r.stderr.strip()[:80]}")
+        else:
+            applied.append(control)
+
+    bits = applied + ([f"saturation {SATURATION}"] if SATURATION is not None else [])
+    log("  " + ", ".join(bits + ["white balance: camera AWB"]))
+
+def read_actuators():
+    """Read exposure and gain from the camera. None if either fails."""
+    e = get_ctrl("exposure_time_absolute")
+    g = get_ctrl("gain")
+    if e is None or g is None:
+        return None
+    return e, g
+
+# =========================================================================
+# ffmpeg
+# =========================================================================
+ff = None
+
+def video_filters():
+    f = []
+    if LUT and os.path.exists(LUT):
+        f.append(f"lut3d={LUT}")
+    if VIBRANCE:
+        f.append(f"vibrance=intensity={VIBRANCE}")
+    return ["-vf", ",".join(f)] if f else []
+
+def start_ffmpeg():
+    return subprocess.Popen([
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "v4l2", "-input_format", "mjpeg",
+        "-video_size", f"{W}x{H}", "-framerate", str(FPS), "-i", CAM,
+        # 1: the virtual camera Zoom reads
+        "-map", "0:v", *video_filters(),
+        "-pix_fmt", "yuv420p", "-f", "v4l2", VCAM,
+        # 2: metering frames down the pipe
+        "-map", "0:v", "-vf", f"fps=1,scale={MW}:{MH}",
+        "-pix_fmt", "yuv420p", "-f", "rawvideo", "pipe:1",
+        # 3: snapshot, so the output can be inspected while Zoom holds it
+        *(["-map", "0:v", "-vf", f"fps=1/{SNAPSHOT_SECS}", "-q:v", "3",
+           "-update", "1", "-y", SNAPSHOT] if SNAPSHOT and SNAPSHOT_SECS else []),
+    ], stdout=subprocess.PIPE)
+
+def stop_ffmpeg():
+    global ff
+    if ff is None:
+        return
+    if ff.poll() is None:
+        ff.terminate()
+        try:
+            ff.wait(3)
+        except subprocess.TimeoutExpired:
+            ff.kill()
+    if ff.stdout:
+        ff.stdout.close()          # previously leaked one fd per restart
+    ff = None
+
+# =========================================================================
+# Metering
+# =========================================================================
+_samples = deque(maxlen=16)        # (timestamp, p70, p99)
+_pipe_err = None
+
+def measure(buf):
+    """(p70, p99) of the metering box on one yuv420p frame's Y plane."""
+    x0, x1 = int(MW * BOX[0]), int(MW * BOX[1])
+    y0, y1 = int(MH * BOX[2]), int(MH * BOX[3])
+    vals = sorted(buf[y * MW + x] for y in range(y0, y1) for x in range(x0, x1))
+    if not vals:
+        return None
+    n = len(vals)
+    return (vals[min(n - 1, int(n * PERCENTILE / 100))],
+            vals[min(n - 1, int(n * HIGH_PCT / 100))])
+
+def reader():
+    """Read metering frames as they arrive, measure them, timestamp them.
+
+    Must never die: if it stops draining the pipe, ffmpeg blocks on write
+    and ALL its outputs stall - including the virtual camera Zoom is using.
+    """
+    global _pipe_err
+    n = MW * MH * 3 // 2          # yuv420p frame size
+    while True:
+        try:
+            p = ff
+            if p is None or p.stdout is None:
+                time.sleep(0.5)
+                continue
+            buf = p.stdout.read(n)
+            if not buf or len(buf) < n:
+                _pipe_err = "metering pipe closed"
+                time.sleep(0.5)
+                continue
+            m = measure(buf)
+            if m is not None:
+                _samples.append((time.time(), m[0], m[1]))
+                _pipe_err = None
+        except Exception as e:           # keep draining no matter what
+            _pipe_err = f"reader: {e}"
+            time.sleep(0.5)
+
+def fresh_reading(since):
+    """Median (p70, p99) over recent samples taken after `since`, or None."""
+    now = time.time()
+    use = [s for s in _samples if s[0] > since and now - s[0] < STALE_S]
+    use = use[-SMOOTH_N:]
+    if len(use) < MIN_SAMPLES:
+        return None
+    def median(xs):
+        xs = sorted(xs)
+        k = len(xs)
+        return xs[k // 2] if k % 2 else (xs[k // 2 - 1] + xs[k // 2]) // 2
+    return median([s[1] for s in use]), median([s[2] for s in use])
+
+# =========================================================================
+# Controller
+# =========================================================================
+def step_exposure(cur, factor):
+    """Scale exposure by factor, always moving at least one unit.
+
+    Exposure is an integer; at low values a proportional step rounds away
+    (8 * 1.12 -> 8), which once made the loop believe exposure could not
+    move, report "maxed", and pile on gain instead.
+    """
+    want = cur * factor
+    if factor > 1.0:
+        new = max(cur + 1, int(want))
+    elif factor < 1.0:
+        new = min(cur - 1, int(want))
+    else:
+        new = cur
+    return max(EXP_MIN, min(EXP_MAX, new))
+
+def darken(exp, gain, factor):
+    """Give back gain first (it is noise), then exposure."""
+    if gain > 0:
+        drop = (1.0 - factor) * TARGET / GAIN_PER_LUMA
+        step = max(1, min(GAIN_STEP_DOWN, round(drop)))
+        return exp, max(0, gain - step)
+    return step_exposure(exp, factor), gain
+
+def brighten(exp, gain, factor):
+    """Spend exposure first, then gain."""
+    if exp < EXP_MAX:
+        return step_exposure(exp, factor), gain
+    if gain < GAIN_MAX:
+        raise_ = (factor - 1.0) * TARGET / GAIN_PER_LUMA
+        step = max(1, min(GAIN_STEP_UP, round(raise_)))
+        return exp, min(GAIN_MAX, gain + step)
+    return exp, gain
+
+def decide(lvl, high, exp, gain):
+    """Return (new_exp, new_gain, why). Unchanged actuators mean 'hold'.
+
+    Two constraints, one controller:
+      1. keep the subject near TARGET        (p70)
+      2. keep highlights off the ceiling     (p99)
+    These disagree in a dark room with a lit subject. The rule: the ceiling
+    VETOES brightening, and forces darkening when exceeded. "Highlights fine
+    and below target" is a legal resting state - that is what lets it settle
+    instead of hunting between the two objectives.
+    """
+    over_ceiling = high > HIGH_MAX + HIGH_DB
+    room_above   = high < HIGH_MAX - HIGH_DB
+
+    if over_ceiling and lvl > SUBJECT_FLOOR:
+        if high >= SAT_LEVEL:
+            factor = 1.0 - SAT_STEP
+            why = "saturated"
+        else:
+            excess = high - HIGH_MAX
+            factor = 1.0 - min(MAX_STEP_DOWN, max(0.03, DAMPING * excess / max(lvl, 1)))
+            why = "over ceiling"
+        e, g = darken(exp, gain, factor)
+        return e, g, why
+
+    if over_ceiling:
+        return exp, gain, "floored: highlights unreachable (sun?)"
+
+    err = TARGET - lvl
+    if err < -DEADBAND:
+        factor = max(1.0 - MAX_STEP_DOWN, 1.0 + DAMPING * err / max(lvl, 1))
+        e, g = darken(exp, gain, factor)
+        return e, g, "above target"
+
+    if err > DEADBAND:
+        if not room_above:
+            return exp, gain, "dim, highlights veto"
+        factor = min(1.0 + MAX_STEP_UP, 1.0 + DAMPING * err / max(lvl, 1))
+        e, g = brighten(exp, gain, factor)
+        return e, g, "below target"
+
+    return exp, gain, "in band"
+
+# =========================================================================
+# Main loop
+# =========================================================================
+def parse_args():
+    ap = argparse.ArgumentParser(
+        prog="lumaloop",
+        description="Subject-weighted auto exposure for a USB webcam, "
+                    "feeding a v4l2loopback virtual camera.",
+        epilog=f"config file: {CONFIG_PATH} (optional; see "
+               "config.example.toml for every setting)")
+    ap.add_argument("-c", "--config", default=CONFIG_PATH,
+                    help="path to a TOML config file")
+    ap.add_argument("--list-devices", action="store_true",
+                    help="show video devices and exit, to find yours")
+    ap.add_argument("--show-config", action="store_true",
+                    help="show the effective settings and exit")
+    return ap.parse_args()
+
+
+def main():
+    global ff, CAM, VCAM
+    args = parse_args()
+    for note in load_config(args.config):
+        log(note)
+
+    if args.list_devices:
+        list_devices()
+        return
+    if args.show_config:
+        show_config()
+        return
+
+    for tool, hint in (("ffmpeg", "install ffmpeg with your package manager"),
+                       ("v4l2-ctl", "install v4l-utils with your package manager")):
+        if sh(f"command -v {tool}").returncode != 0:
+            sys.exit(f"{tool} not installed - {hint}")
+
+    CAM = resolve_cam()
+    if not CAM:
+        sys.exit(f"camera not found - is it plugged in? "
+                 f"({describe_camera_setting()}; "
+                 f"run `lumaloop --list-devices` to see what is attached)")
+    VCAM = resolve_vcam()
+    if not VCAM:
+        sys.exit("virtual camera not found - load the module with "
+                 "`sudo modprobe v4l2loopback` (see README for making that "
+                 "persistent)")
+
+    if SNAPSHOT and SNAPSHOT_SECS:
+        try:
+            os.makedirs(os.path.dirname(SNAPSHOT), exist_ok=True)
+        except OSError as e:
+            sys.exit(f"cannot create the snapshot directory: {e}")
+
+    atexit.register(stop_ffmpeg)
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, lambda *a: sys.exit(0))
+
+    log(f"{CAM} -> {VCAM}  {W}x{H}@{FPS}   p{PERCENTILE} target {TARGET}, "
+        f"p{HIGH_PCT} ceiling {HIGH_MAX}")
+    ff = start_ffmpeg()
+    threading.Thread(target=reader, daemon=True).start()
+    time.sleep(4)
+    if ff.poll() is not None:
+        sys.exit("ffmpeg failed to start - camera in use? (close OBS / stray ffmpeg)")
+
+    camera_setup()
+    act = read_actuators()
+    if act is None:
+        sys.exit("cannot read exposure/gain from camera")
+    exp, gain = act
+    # Clamp anything a previous run or the firmware left out of range, so the
+    # first log line is not a lie about direction.
+    exp = max(EXP_MIN, min(EXP_MAX, exp))
+    gain = max(0, min(GAIN_MAX, gain))
+    set_ctrls(exposure_time_absolute=exp, gain=gain)
+    vcam_label = dict(_nodes()).get(VCAM, VCAM)
+    log(f"pipeline up - pick '{vcam_label}' as the camera in your video app. "
+        f"ctrl-c to stop.")
+    log(f"  start: exposure {exp}  gain {gain}")
+
+    last_act  = 0.0
+    last_beat = time.time()
+    last_note = None
+
+    while True:
+        now = time.time()
+
+        if ff.poll() is not None:
+            log("ffmpeg died, restarting")
+            stop_ffmpeg()
+            _samples.clear()
+            ff = start_ffmpeg()
+            time.sleep(4)
+            if ff.poll() is None:
+                camera_setup()            # the camera may have power-cycled
+                act = read_actuators()
+                if act:
+                    exp, gain = act
+            last_act = time.time()
+            continue
+
+        # Periodically resync with the camera in case something else touched
+        # it, and log if so - the loop otherwise trusts its own bookkeeping.
+        if now - last_beat > HEARTBEAT_S:
+            act = read_actuators()
+            if act and act != (exp, gain):
+                log(f"  camera drifted: exposure {exp}->{act[0]} gain {gain}->{act[1]} (adopting)")
+                exp, gain = act
+
+        r = fresh_reading(since=last_act + LATENCY_S)
+        if r is None:
+            if now - last_beat > HEARTBEAT_S:
+                log(f"  waiting for metering frames ({_pipe_err or 'settling'})  "
+                    f"exposure {exp}  gain {gain}")
+                last_beat = now
+            time.sleep(INTERVAL_S)
+            continue
+        lvl, high = r
+
+        new_exp, new_gain, why = decide(lvl, high, exp, gain)
+        changed = (new_exp, new_gain) != (exp, gain)
+        mark = "*" if why in ("saturated", "over ceiling") else " "
+
+        if changed:
+            if new_exp != exp:
+                what = f"exposure {exp} -> {new_exp}"
+            else:
+                what = f"gain {gain} -> {new_gain}"
+            set_ctrls(exposure_time_absolute=new_exp, gain=new_gain)
+            exp, gain = new_exp, new_gain
+            log(f"  p{PERCENTILE} {lvl:3d} p{HIGH_PCT} {high:3d}{mark} {what:24} ({why})")
+            last_act = now
+            last_beat = now
+            last_note = None
+        else:
+            # Nothing to do, or nothing CAN be done. Both are worth saying,
+            # once on entry and then at heartbeat rate - never silently.
+            at_limit = ("below target" in why and exp >= EXP_MAX and gain >= GAIN_MAX) or \
+                       (why in ("saturated", "over ceiling") and exp <= EXP_MIN and gain == 0)
+            if at_limit:
+                why += " - AT LIMIT"
+            if why != last_note or now - last_beat > HEARTBEAT_S:
+                log(f"  p{PERCENTILE} {lvl:3d} p{HIGH_PCT} {high:3d}{mark} "
+                    f"exposure {exp}  gain {gain}   ({why})")
+                last_beat = now
+                last_note = why
+
+        time.sleep(INTERVAL_S)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

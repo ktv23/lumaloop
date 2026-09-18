@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Unit]
+Description=Webcam auto-exposure pipeline into the virtual camera
+Documentation=file:%h/.local/bin/lumaloop
+After=graphical-session.target
+
+# No start-limit on purpose. The camera is often unplugged at boot and
+# plugged in later, and the script exits in well under a second when it
+# cannot find one. With systemd's default burst of 5 (or any small limit),
+# those fast exits trip the limiter within a minute and the unit sits in
+# 'failed' forever - Restart=always never fires again, so plugging the
+# camera in does nothing. Retrying indefinitely costs ~80ms every 15s.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/lumaloop
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
