@@ -216,6 +216,16 @@ DEFAULTS = {k: v for k, v in list(globals().items())
 _CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 CONFIG_PATH  = os.path.join(_CONFIG_HOME, "lumaloop", "config.toml")
 
+# The status window's target slider writes here, and the loop re-reads it every
+# iteration, so the subject level can be tuned mid-call without a restart (a
+# restart is ~4s of dead video and a fresh settle). It is a separate one-line
+# file rather than an edit to config.toml: stdlib can read TOML but not write
+# it, and rewriting a hand-commented config from a GUI is how comments get
+# lost. Present, it beats the config's `target`; absent, the config's wins.
+_STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+TARGET_PATH = os.path.join(_STATE_HOME, "lumaloop", "target")
+_TARGET_LO, _TARGET_HI = 40, 220   # past these the ceiling or the floor rules anyway
+
 
 def _coerce(value, default):
     """Match a config value to the type of the default it replaces."""
@@ -273,12 +283,30 @@ def load_config(path):
     return notes
 
 
+def read_target_override():
+    """The target set from the status window, or None if there is none.
+
+    Anything unreadable counts as no override: a half-written or garbled file
+    must never take exposure somewhere strange, and the config's target is
+    always a safe fallback.
+    """
+    try:
+        with open(TARGET_PATH) as fh:
+            value = int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    return max(_TARGET_LO, min(_TARGET_HI, value))
+
+
 def show_config():
     for name in sorted(DEFAULTS):
         current, default = globals()[name], DEFAULTS[name]
         mark = "  " if current == default else "* "
         print(f"{mark}{name.lower():<16} {current!r}")
     print("\n* = changed from the built-in default")
+    if read_target_override() is not None:
+        print(f"target is set from the status window ({TARGET_PATH}); "
+              "the config's value applies once that is reset")
 
 
 def list_devices():
@@ -604,10 +632,14 @@ def parse_args():
 
 
 def main():
-    global ff, CAM, VCAM
+    global ff, CAM, VCAM, TARGET
     args = parse_args()
     for note in load_config(args.config):
         log(note)
+    config_target = TARGET
+    override = read_target_override()
+    if override is not None:
+        TARGET = override
 
     if args.list_devices:
         list_devices()
@@ -671,6 +703,16 @@ def main():
 
     while True:
         now = time.time()
+
+        # One small read a second. A new target needs no reset of the loop's
+        # state: the next fresh reading is simply judged against it.
+        override = read_target_override()
+        want = config_target if override is None else override
+        if want != TARGET:
+            source = "config" if override is None else "status window"
+            log(f"  target {TARGET} -> {want} (from the {source})")
+            TARGET = want
+            last_note = None
 
         if ff.poll() is not None:
             log("ffmpeg died, restarting")

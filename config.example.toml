@@ -33,7 +33,9 @@
 [exposure]
 # The target is a percentile of a metering box, not a frame average - see the
 # comments in `lumaloop` for why. target is the luma level (0-255) the subject
-# should sit at; raise it for a brighter picture.
+# should sit at; raise it for a brighter picture. The status window's Target
+# slider overrides this live, from ~/.local/state/lumaloop/target, until you
+# press Reset there.
 # target     = 132
 # percentile = 70
 # deadband   = 5

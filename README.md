@@ -146,6 +146,18 @@ The line under the preview is deliberate: a still room looks identical whether
 the picture is live or frozen, so the window counts frames rather than asking
 you to trust it. The preview cannot update faster than `snapshot_secs`.
 
+The dashed box on the preview is the metering box. Its label shows the
+subject level against the target and the highlight level against the ceiling,
+from the last metering line the pipeline logged. While the loop is holding
+steady it logs only every `heartbeat_s`, so those numbers can lag a still
+picture by that much.
+
+**Target** sets how bright the loop keeps you. It applies to the running
+pipeline within a couple of seconds, with no restart, and is remembered across
+restarts. The window stores it in `~/.local/state/lumaloop/target`, which
+takes precedence over `target` in your config. **Reset** removes that file and
+returns to the configured value.
+
 ## How the loop works
 
 Two constraints, one controller:

@@ -36,17 +36,22 @@ is only a face on it, and does three things:
     camera nothing else can stream it, so that snapshot is the only way to see
     what the pipeline is actually producing.
 
-Reads the same config file as the pipeline, for the snapshot path.
+  - sets the target brightness. The slider writes a one-line file the running
+    pipeline re-reads every second, so it applies live, mid-call, and sticks
+    across restarts. Reset removes the file and hands control back to config.
+
+Reads the same config file as the pipeline, for the snapshot path and the
+configured target.
 """
 import os
 import re
 import subprocess
 import time
 
-from PySide6.QtCore import Qt, QFileSystemWatcher, QProcess, QTimer
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtCore import Qt, QFileSystemWatcher, QProcess, QRectF, QTimer
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QPushButton,
-                               QSizePolicy, QVBoxLayout, QWidget)
+                               QSizePolicy, QSlider, QVBoxLayout, QWidget)
 
 try:
     import tomllib                     # Python 3.11+
@@ -82,6 +87,18 @@ def _configured(key, fallback):
 SNAPSHOT = os.path.expanduser(
     _configured("snapshot", os.path.join(_CACHE_HOME, "lumaloop", "snap.jpg")))
 VCAM_LABEL = _configured("vcam_name", "") or "the virtual camera"
+
+# Must match TARGET_PATH and the clamp in `lumaloop`.
+_STATE_HOME   = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+TARGET_PATH   = os.path.join(_STATE_HOME, "lumaloop", "target")
+CONFIG_TARGET = int(_configured("target", 132))
+TARGET_LO, TARGET_HI = 40, 220
+TARGET_SAVE_MS = 300   # debounce: a slider drag is dozens of values
+
+# The metering box, drawn on the preview. The snapshot is the full uncropped
+# frame, so the pipeline's frame fractions map straight onto it.
+BOX      = tuple(float(v) for v in _configured("box", (0.25, 0.75, 0.10, 1.00)))
+HIGH_MAX = int(_configured("high_max", 235))
 PREVIEW_W   = 384
 PREVIEW_H   = 216
 SNAP_STALE  = 25     # seconds before a snapshot counts as "not arriving"
@@ -177,6 +194,11 @@ class CameraWindow(QWidget):
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setStyleSheet(
             "background: #1b1b1b; border-radius: 6px; color: #777;")
+        self.preview.setToolTip(
+            "The dashed box is where brightness is measured.\n"
+            "subject: the 70th-percentile level in the box, held near the target.\n"
+            "bright: the 99th-percentile level, kept under the ceiling so\n"
+            "highlights do not clip. Levels are 0-255.")
         root.addWidget(self.preview, 0, Qt.AlignHCenter)
 
         # The picture alone cannot show whether it is live: a still room looks
@@ -205,6 +227,8 @@ class CameraWindow(QWidget):
         # Gain is only interesting once the camera runs out of exposure and
         # starts trading noise for brightness, so it stays hidden at 0.
         self.rows["Gain"].hide()
+
+        self.build_target_row(root)
 
         self.hint = QLabel()
         self.hint.setWordWrap(True)
@@ -250,6 +274,87 @@ class CameraWindow(QWidget):
         self.clock.timeout.connect(self.tick)
         self.clock.start(CLOCK_MS)
         self.tick()
+
+    # -- the target -------------------------------------------------------
+
+    def build_target_row(self, root):
+        lay = QHBoxLayout()
+        lay.setContentsMargins(0, 0, 0, 0)
+        key = QLabel("Target")
+        key.setFixedWidth(96)
+        key.setStyleSheet(f"color: {dimmed(key)};")
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(TARGET_LO, TARGET_HI)
+        self.slider.setPageStep(10)
+        self.slider.setToolTip(
+            "How bright the camera keeps you, as a 0-255 level.\n"
+            "Higher is brighter. Applies within a couple of seconds,\n"
+            "with no restart, and is remembered.")
+
+        self.target_label = QLabel()
+        self.target_label.setFixedWidth(28)
+        self.target_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        self.reset = QPushButton("Reset")
+        self.reset.setToolTip(f"Back to the configured target ({CONFIG_TARGET})")
+        self.reset.clicked.connect(lambda: self.slider.setValue(CONFIG_TARGET))
+
+        lay.addWidget(key)
+        lay.addWidget(self.slider, 1)
+        lay.addWidget(self.target_label)
+        lay.addWidget(self.reset)
+        root.addLayout(lay)
+
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(TARGET_SAVE_MS)
+        self.save_timer.timeout.connect(self.save_target)
+
+        self.slider.setValue(self.load_target())
+        self.show_target(self.slider.value())
+        self.slider.valueChanged.connect(self.target_moved)
+
+    @staticmethod
+    def load_target():
+        """What the pipeline will use: the saved override, else the config."""
+        try:
+            with open(TARGET_PATH) as fh:
+                value = int(fh.read().strip())
+        except (OSError, ValueError):
+            return CONFIG_TARGET
+        return max(TARGET_LO, min(TARGET_HI, value))
+
+    def show_target(self, value):
+        self.target_label.setText(str(value))
+        self.reset.setEnabled(value != CONFIG_TARGET)
+        if self.active:
+            self.draw_preview()      # the overlay names the target
+
+    def target_moved(self, value):
+        self.show_target(value)
+        self.save_timer.start()
+
+    def save_target(self):
+        """Write atomically, so the pipeline never reads half a number.
+
+        Landing back on the configured value removes the file instead, so a
+        later edit to config.toml is not silently shadowed by a stale override.
+        """
+        value = self.slider.value()
+        try:
+            if value == CONFIG_TARGET:
+                if os.path.exists(TARGET_PATH):
+                    os.remove(TARGET_PATH)
+                return
+            os.makedirs(os.path.dirname(TARGET_PATH), exist_ok=True)
+            tmp = TARGET_PATH + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(f"{value}\n")
+            os.replace(tmp, TARGET_PATH)
+        except OSError as e:
+            self.note = f"Could not save the target: {e.strerror}"
+            self.refresh()
 
     # -- the unit ---------------------------------------------------------
 
@@ -424,6 +529,7 @@ class CameraWindow(QWidget):
             return
         pix = pix.scaled(PREVIEW_W, PREVIEW_H,
                          Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.draw_metering(pix)
 
         # A snapshot that has stopped updating means the pipeline is stalled,
         # not that the picture is fine. Say so on the picture itself.
@@ -437,11 +543,64 @@ class CameraWindow(QWidget):
         self.preview.setText("")
         self.preview.setPixmap(pix)
 
+    def draw_metering(self, pix):
+        """Outline the metering box and print what was measured inside it.
+
+        The numbers come from the last metering line in the journal. The
+        pipeline logs on every correction but only every 30s while holding,
+        so a settled picture can show readings up to that old - they are
+        still what the loop is acting on.
+        """
+        w, h = pix.width(), pix.height()
+        x0, x1, y0, y1 = BOX
+        box = QRectF(x0 * w, y0 * h, (x1 - x0) * w, (y1 - y0) * h).adjusted(1, 1, -1, -1)
+
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Dark under white, so the outline reads on a white wall and a black
+        # shirt alike.
+        painter.setPen(QPen(QColor(0, 0, 0, 150), 3))
+        painter.drawRect(box)
+        painter.setPen(QPen(QColor(255, 255, 255, 220), 1.5, Qt.DashLine))
+        painter.drawRect(box)
+
+        target = self.slider.value()
+        if self.meter:
+            m = self.meter
+            lines = [f"subject {m['lvl']:>3} / target  {target}",
+                     f"bright  {m['high']:>3} / ceiling {HIGH_MAX}"]
+        else:
+            lines = [f"measuring...  target {target}"]
+
+        font = QFont("monospace")
+        font.setStyleHint(QFont.Monospace)
+        font.setPixelSize(10)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        pad = 4
+        tw = max(fm.horizontalAdvance(t) for t in lines) + 2 * pad
+        th = fm.height() * len(lines) + 2 * pad
+        # Inside the box when it fits; never off the picture.
+        label = QRectF(min(box.left() + 4, w - tw - 2), box.top() + 4, tw, th)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 160))
+        painter.drawRoundedRect(label, 3, 3)
+        painter.setPen(QColor("#ffffff"))
+        for i, text in enumerate(lines):
+            painter.drawText(QRectF(label.left() + pad,
+                                    label.top() + pad + i * fm.height(),
+                                    tw, fm.height()),
+                             Qt.AlignLeft | Qt.AlignVCenter, text)
+        painter.end()
+
     @staticmethod
     def stale(mtime):
         return time.time() - mtime > SNAP_STALE
 
     def closeEvent(self, event):
+        if self.save_timer.isActive():   # a drag released just before closing
+            self.save_timer.stop()
+            self.save_target()
         self.stop_journal()
         super().closeEvent(event)
 
